@@ -27,7 +27,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 # ========= HELPER FUNCTIONS =========
 def save_to_excel(username, password, tfa, user_id, user_name):
     """Save account details to Excel file"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     if os.path.exists(EXCEL_FILE):
         wb = load_workbook(EXCEL_FILE)
@@ -35,9 +34,9 @@ def save_to_excel(username, password, tfa, user_id, user_name):
     else:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Username", "Password", "2FA", "Timestamp", "User ID", "User Name"])
+        ws.append(["Username", "Password", "2FA"])
     
-    ws.append([username, password, tfa, timestamp, user_id, user_name])
+    ws.append([username, password, tfa])
     wb.save(EXCEL_FILE)
     return True
 
