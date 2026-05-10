@@ -102,7 +102,7 @@ def delete_accounts(user_id: int) -> int:
 
 MAIN_MENU_KB = ReplyKeyboardMarkup(
     [
-        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓 📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
+        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓  📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
         ["👤 𝘼𝙙𝙢𝙞𝙣"],
         ["📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙..."],
     ],
@@ -327,30 +327,18 @@ def build_excel(accounts: list[dict]) -> io.BytesIO:
     ws.title = "Accounts"
 
     # Header row
-    headers = ["#", "Username", "Password", "2FA Secret", "Timestamp"]
-    ws.append(headers)
+    headers = ["Username", "Password", "2FA Secret"]
+ws.append(headers)
 
-    # Style header
-    from openpyxl.styles import Font, PatternFill, Alignment
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(fill_type="solid", fgColor="2E86C1")
-    for col_idx, _ in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # Data rows
-    for i, acc in enumerate(accounts, start=1):
-        ws.append(
-            [
-                i,
-                acc.get("username", ""),
-                acc.get("password", ""),
-                acc.get("secret", ""),
-                acc.get("timestamp", ""),
-            ]
-        )
+# Data rows
+for acc in accounts:
+    ws.append(
+        [
+            acc.get("username", ""),
+            acc.get("password", ""),
+            acc.get("secret", ""),
+        ]
+    )
 
     # Auto-size columns
     for col in ws.columns:
