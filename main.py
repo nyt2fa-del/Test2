@@ -2,7 +2,6 @@ import os
 import random
 import string
 import asyncio
-from datetime import datetime
 from openpyxl import Workbook, load_workbook
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
@@ -26,17 +25,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # ========= HELPER FUNCTIONS =========
 def save_to_excel(username, password, tfa, user_id, user_name):
-    """Save account details to Excel file"""
-    
-    if os.path.exists(EXCEL_FILE):
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb.active
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.append(["Username", "Password", "2FA"])
-    
-    ws.append([username, password, tfa])
+    """Save account details to Excel file - Empty file, no data stored"""
+    # Create completely empty Excel file
+    wb = Workbook()
     wb.save(EXCEL_FILE)
     return True
 
