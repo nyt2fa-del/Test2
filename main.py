@@ -102,9 +102,9 @@ def delete_accounts(user_id: int) -> int:
 
 MAIN_MENU_KB = ReplyKeyboardMarkup(
     [
-        ["✅ Submit Account", "🎭 Fake Info"],
-        ["👤 Admin"],
-        ["📥 Download"],
+        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓 📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
+        ["👤 𝘼𝙙𝙢𝙞𝙣"],
+        ["📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙..."],
     ],
     resize_keyboard=True,
 )
