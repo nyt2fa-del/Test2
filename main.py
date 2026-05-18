@@ -93,7 +93,7 @@ async def developer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "<b>👨‍💻 Developer Info</b>\n\n"
         "• <b>Name:</b> Your Name\n"
-        "• <b>Telegram:</b> <a href=\"[t.me](https://t.me/yourusername\)">@yourusername</a>\n\n"
+        "• <b>Telegram:</b> <a href=\"https://t.me/sefuax\">@sefuax</a>\n\n"
         "<b>⚠️ Disclaimer</b>\n"
         "This bot is provided for <i>educational and personal-account</i> use only. "
         "You are solely responsible for the credentials you submit. The developer is not "
