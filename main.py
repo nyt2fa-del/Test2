@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# main.py - Instagram Account Status Checker Bot
-# Features: Check live/suspended accounts, admin notifications, Excel export of user history
+# main.py - Instagram Profile Link Bot (No fake checking, just links that open in Telegram browser)
 
 import os
 import re
@@ -9,7 +8,6 @@ import asyncio
 import logging
 from datetime import datetime
 from io import BytesIO
-from typing import List, Tuple, Optional
 
 import requests
 from openpyxl import Workbook
@@ -17,6 +15,8 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
@@ -39,13 +39,6 @@ AWAITING_USERNAMES = 1
 
 # Database setup
 DB_PATH = "instagram_checker.db"
-
-# Instagram request headers
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-}
 
 # Logger
 logging.basicConfig(
@@ -82,7 +75,7 @@ def add_check_to_db(user_id: int, username: str, status: str, link: str):
     conn.commit()
     conn.close()
 
-def get_user_checks(user_id: int) -> List[Tuple]:
+def get_user_checks(user_id: int):
     """Retrieve all check records for a specific user."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -93,49 +86,6 @@ def get_user_checks(user_id: int) -> List[Tuple]:
     data = cursor.fetchall()
     conn.close()
     return data
-
-# ========== INSTAGRAM CHECK LOGIC ==========
-def check_instagram(username: str) -> Tuple[str, str]:
-    """
-    Check if Instagram account exists (live) or suspended/not found.
-    Returns (status, link)
-    status: "✅ Live" or "❌ Suspended" or "⚠️ Error"
-    """
-    # Remove @ if present and strip
-    username = username.strip().lstrip("@")
-    link = f"https://www.instagram.com/{username}/"
-
-    try:
-        response = requests.get(link, headers=HEADERS, timeout=10, allow_redirects=True)
-        # Instagram returns 404 for non-existent or suspended accounts
-        if response.status_code == 404:
-            return "❌ Suspended/Not Found", link
-
-        # Sometimes returns 200 but with error page content
-        if response.status_code == 200:
-            text = response.text.lower()
-            # Common error indicators in page content
-            error_phrases = [
-                "sorry, this page isn't available",
-                "page not found",
-                "the link you followed may be broken",
-                "the page may have been removed",
-                "we couldn't find this account"
-            ]
-            if any(phrase in text for phrase in error_phrases):
-                return "❌ Suspended/Not Found", link
-            else:
-                # Account exists and is live (could be private, but it's live)
-                return "✅ Live", link
-        else:
-            return "⚠️ Error (unexpected response)", link
-    except requests.exceptions.Timeout:
-        return "⚠️ Timeout Error", link
-    except requests.exceptions.ConnectionError:
-        return "⚠️ Connection Error", link
-    except Exception as e:
-        logger.error(f"Check error for {username}: {e}")
-        return "⚠️ Check Failed", link
 
 # ========== TELEGRAM BOT HANDLERS ==========
 def get_main_keyboard():
@@ -153,13 +103,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_msg = (
         f"👋 Welcome {user.first_name}!\n\n"
-        f"I can check Instagram accounts to see if they are live or suspended.\n\n"
+        f"Send me Instagram usernames, and I'll give you clickable links that open **inside Telegram's browser** (not Instagram app or Chrome).\n\n"
         f"🔹 Press '🔴 𝘾𝙝𝙚𝙘𝙠 𝘼𝘾𝘾𝙊𝙐𝙉𝙏' to begin.\n"
         f"🔹 Send multiple usernames (one per line).\n\n"
-        f"✅ Live accounts exist on Instagram.\n"
-        f"❌ Suspended accounts are not accessible."
+        f"✅ Each username will get a button → tap to open profile in Telegram."
     )
-    await update.message.reply_text(welcome_msg, reply_markup=get_main_keyboard())
+    await update.message.reply_text(welcome_msg, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
     # Notify admin about new user
     full_name = user.full_name or "No name"
@@ -184,12 +133,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Show welcome menu\n"
         "/help - Show this help\n"
         "/cancel - Cancel current operation\n\n"
-        "*How to check accounts:*\n"
+        "*How to get profile links:*\n"
         "1. Press the '🔴 𝘾𝙝𝙚𝙘𝙠 𝘼𝘾𝘾𝙊𝙐𝙉𝙏' button\n"
         "2. Send Instagram username(s) (one per line)\n"
-        "3. Wait for results\n\n"
+        "3. Tap the buttons to open profiles in Telegram browser\n\n"
         "*Admin commands:*\n"
-        "/download <user_chat_id> - Export check history to Excel"
+        "/download <user_chat_id> - Export history to Excel"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
@@ -229,21 +178,24 @@ async def check_account_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
         "`@cristiano`\n\n"
         "You can send multiple like:\n"
         "`username1\nusername2\nusername3`\n\n"
+        "➡️ I will reply with **buttons** that open each profile in Telegram browser.\n\n"
         "To cancel, send /cancel.",
         parse_mode="Markdown",
     )
     return AWAITING_USERNAMES
 
 async def receive_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process received usernames, check each, store results, and reply."""
+    """Process received usernames, store in DB, and send inline buttons with links."""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     if not text:
         await update.message.reply_text("❌ No usernames detected. Please send valid usernames.")
         return AWAITING_USERNAMES
 
-    # Split by newline and filter empty lines
-    usernames = [u.strip() for u in text.splitlines() if u.strip()]
+    # Split by newline and filter empty lines, remove @ if present
+    raw_usernames = [u.strip() for u in text.splitlines() if u.strip()]
+    usernames = [u.lstrip('@') for u in raw_usernames]
+
     if not usernames:
         await update.message.reply_text("❌ No valid usernames found. Please send at least one username.")
         return AWAITING_USERNAMES
@@ -256,42 +208,25 @@ async def receive_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send a processing message
     processing_msg = await update.message.reply_text(
-        f"🔍 Checking {len(usernames)} account(s)...\nPlease wait, this may take a moment."
+        f"🔗 Generating links for {len(usernames)} username(s)..."
     )
 
-    # Results list for final message
-    results_text = []
-    for idx, username in enumerate(usernames, 1):
-        status, link = check_instagram(username)
-        # Store in database
-        add_check_to_db(user_id, username, status, link)
+    # Store in database and collect inline buttons
+    buttons = []
+    for username in usernames:
+        link = f"https://www.instagram.com/{username}/"
+        # Store with status "Link Generated"
+        add_check_to_db(user_id, username, "🔗 Link Generated", link)
+        buttons.append([InlineKeyboardButton(f"📸 {username}", url=link)])
 
-        # Format result line
-        if "✅" in status:
-            icon = "✅"
-        elif "❌" in status:
-            icon = "❌"
-        else:
-            icon = "⚠️"
-        results_text.append(f"{icon} *{username}*: {status}\n🔗 {link}")
-
-        # Small delay to avoid being too aggressive
-        await asyncio.sleep(0.5)
-
-    # Build final message
-    final_message = (
-        f"📊 *Check Results* ({len(usernames)} account(s))\n\n"
-        + "\n\n".join(results_text)
-        + "\n\n✅ *Live* = Account exists\n❌ *Suspended* = Not accessible\n⚠️ *Error* = Temporary issue"
-    )
-
-    # Truncate if too long (Telegram limit 4096)
-    if len(final_message) > 4000:
-        final_message = final_message[:3500] + "\n\n... (truncated, too many results)"
-
+    # Send a message with inline keyboard (opens in Telegram browser)
     await processing_msg.delete()
-    await update.message.reply_text(final_message, parse_mode="Markdown", disable_web_page_preview=True)
-    await update.message.reply_text("✨ Use the menu to check more accounts.", reply_markup=get_main_keyboard())
+    await update.message.reply_text(
+        f"✅ *Profile links ready!* (Total: {len(usernames)})\n\nTap any button below to open in Telegram's built-in browser 👇",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+    await update.message.reply_text("✨ Use the menu to get more links.", reply_markup=get_main_keyboard())
     return ConversationHandler.END
 
 async def admin_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,7 +255,7 @@ async def admin_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Fetch data from database
     checks = get_user_checks(target_chat_id)
     if not checks:
-        await update.message.reply_text(f"ℹ️ No check history found for user `{target_chat_id}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"ℹ️ No history found for user `{target_chat_id}`.", parse_mode="Markdown")
         return
 
     # Create Excel file in memory
@@ -332,13 +267,11 @@ async def admin_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for username, status, link, timestamp in checks:
         ws.append([username, status, link, timestamp])
 
-    # Save to BytesIO
     excel_buffer = BytesIO()
     wb.save(excel_buffer)
     excel_buffer.seek(0)
 
-    # Send file to admin
-    filename = f"instagram_checks_user_{target_chat_id}.xlsx"
+    filename = f"instagram_links_user_{target_chat_id}.xlsx"
     await update.message.reply_document(
         document=excel_buffer,
         filename=filename,
@@ -357,14 +290,12 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== MAIN APPLICATION ==========
 def main():
     """Start the bot."""
-    # Initialize database
     init_db()
     logger.info("Database initialized.")
 
-    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler for checking accounts
+    # Conversation handler for checking accounts (now just gives links)
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔴 𝘾𝙝𝙚𝙘𝙠 𝘼𝘾𝘾𝙊𝙐𝙉𝙏$"), check_account_prompt)],
         states={
@@ -373,7 +304,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel))
